@@ -1,9 +1,16 @@
-const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const { 
+    default: makeWASocket, 
+    DisconnectReason, 
+    fetchLatestBaileysVersion, 
+    makeCacheableSignalKeyStore,
+    initAuthCreds,
+    BufferJSON
+} = require('@whiskeysockets/baileys');
 const { Pool } = require('pg');
 const express = require('express');
 const axios = require('axios');
 const pino = require('pino');
-const QRCode = require('qrcode'); // مكتبة توليد الصور
+const QRCode = require('qrcode');
 
 const app = express();
 app.use(express.json());
@@ -12,68 +19,93 @@ app.use(express.json());
 // إعدادات
 // ------------------------------------------------------------------
 const PORT = process.env.PORT || 8080;
-// تأكد أن هذا الرابط هو رابط بوت البايثون الخاص بك
 const PYTHON_BOT_URL = "https://whatsapp-bot-jh7d.onrender.com/webhook"; 
+
+// يجب وضع رابط قاعدة البيانات في متغيرات البيئة في Render
+// Environment Variables -> DATABASE_URL
 const CONNECTION_STRING = process.env.DATABASE_URL; 
 
-// متغير لتخزين كود الباركود الأخير
 let currentQR = null;
 let isConnected = false;
+let sock;
 
 // ------------------------------------------------------------------
-// إعداد قاعدة البيانات
+// إعداد قاعدة البيانات PostgreSQL
 // ------------------------------------------------------------------
-const pool = new Pool({ connectionString: CONNECTION_STRING, ssl: { rejectUnauthorized: false } });
+if (!CONNECTION_STRING) {
+    console.error("❌ Error: DATABASE_URL is missing!");
+    process.exit(1);
+}
 
+const pool = new Pool({
+    connectionString: CONNECTION_STRING,
+    ssl: { rejectUnauthorized: false } // ضروري لـ Render
+});
+
+// إنشاء الجدول إذا لم يكن موجوداً
 async function initDb() {
     await pool.query(`CREATE TABLE IF NOT EXISTS auth_sessions (id VARCHAR(255) PRIMARY KEY, data TEXT)`);
 }
 
+// دالة لحذف الجلسة بالكامل عند التلف
+async function clearSession() {
+    console.log("⚠️ Clearing corrupted session from database...");
+    await pool.query('DELETE FROM auth_sessions');
+}
+
+// دالة مخصصة للتعامل مع حفظ واسترجاع الجلسة من PostgreSQL
 const usePostgresAuthState = async (saveCreds) => {
     const readData = async (type, id) => {
         const key = `${type}-${id}`;
-        const res = await pool.query('SELECT data FROM auth_sessions WHERE id = $1', [key]);
-        if (res.rows.length > 0) return JSON.parse(res.rows[0].data);
+        try {
+            const res = await pool.query('SELECT data FROM auth_sessions WHERE id = $1', [key]);
+            if (res.rows.length > 0) {
+                return JSON.parse(res.rows[0].data, BufferJSON.reviver);
+            }
+        } catch (error) {
+            console.error('Error reading auth data:', error);
+        }
         return null;
     };
 
     const writeData = async (data, type, id) => {
         const key = `${type}-${id}`;
-        const value = JSON.stringify(data);
-        await pool.query(
-            'INSERT INTO auth_sessions (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = $2',
-            [key, value]
-        );
-    };
-
-    const state = {
-        creds: await readData('creds', 'main') || (await import('@whiskeysockets/baileys')).initAuthCreds(),
-        keys: {
-            get: async (type, ids) => {
-                const data = {};
-                for (const id of ids) {
-                    const val = await readData(type, id);
-                    if (val) data[id] = val;
-                }
-                return data;
-            },
-            set: async (data) => {
-                for (const category in data) {
-                    for (const id in data[category]) {
-                        await writeData(data[category][id], category, id);
-                    }
-                }
-            }
+        try {
+            const value = JSON.stringify(data, BufferJSON.replacer);
+            await pool.query(
+                'INSERT INTO auth_sessions (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = $2',
+                [key, value]
+            );
+        } catch (error) {
+            console.error('Error writing auth data:', error);
         }
     };
 
+    const creds = await readData('creds', 'main') || initAuthCreds();
+
     return {
         state: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
+            creds: creds,
+            keys: makeCacheableSignalKeyStore({
+                get: async (type, ids) => {
+                    const data = {};
+                    for (const id of ids) {
+                        const val = await readData(type, id);
+                        if (val) data[id] = val;
+                    }
+                    return data;
+                },
+                set: async (data) => {
+                    for (const category in data) {
+                        for (const id in data[category]) {
+                            await writeData(data[category][id], category, id);
+                        }
+                    }
+                }
+            }, pino({ level: 'silent' }))
         },
         saveCreds: async () => {
-            await writeData(state.creds, 'creds', 'main');
+            await writeData(creds, 'creds', 'main');
         }
     };
 };
@@ -81,8 +113,6 @@ const usePostgresAuthState = async (saveCreds) => {
 // ------------------------------------------------------------------
 // تشغيل الواتساب
 // ------------------------------------------------------------------
-let sock;
-
 async function startSock() {
     await initDb();
     const { state, saveCreds } = await usePostgresAuthState();
@@ -93,60 +123,79 @@ async function startSock() {
     sock = makeWASocket({
         version,
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: false, // عطلنا الطباعة في اللوج
+        printQRInTerminal: true, 
         auth: state,
-        browser: ["QuranBot", "Chrome", "1.0.0"],
+        browser: ["QuranBot", "Chrome", "3.0.0"],
         connectTimeoutMs: 60000,
         keepAliveIntervalMs: 10000,
         emitOwnEvents: false,
     });
 
-    sock.ev.on('connection.update', (update) => {
+    sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // إذا جاء باركود جديد، نحفظه في المتغير
         if (qr) {
             currentQR = qr;
             isConnected = false;
-            console.log("⚡ QR Code updated, check the website!");
+            console.log("⚡ QR Code generated/updated");
         }
 
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('Connection closed. Reconnecting:', shouldReconnect);
-            if (shouldReconnect) startSock();
+            isConnected = false;
+            const statusCode = (lastDisconnect.error)?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+            console.log('Connection closed. Reason:', statusCode);
+
+            // الحل الجذري لمشكلة التعليق:
+            // إذا كان السبب Bad Session أو Logged Out، نحذف البيانات ونبدأ من الصفر
+            if (statusCode === DisconnectReason.badSession || statusCode === DisconnectReason.loggedOut) {
+                console.log(`Session corrupted or logged out (${statusCode}). Clearing DB and restarting...`);
+                await clearSession(); // حذف الجلسة من قاعدة البيانات
+                startSock(); // إعادة التشغيل لبدء جلسة نظيفة
+            } else if (shouldReconnect) {
+                console.log('Reconnecting...');
+                startSock();
+            } else {
+                console.log('Connection closed strictly. Restarting anyway to be safe...');
+                startSock();
+            }
         } else if (connection === 'open') {
-            console.log('✅ Connection Opened!');
+            console.log('✅ Connection Opened Successfully!');
             isConnected = true;
-            currentQR = null; // نمسح الباركود لأنه تم الاتصال
+            currentQR = null; 
         }
     });
 
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('messages.upsert', async (m) => {
-        const msg = m.messages[0];
-        if (!msg.message || msg.key.fromMe) return;
+        try {
+            const msg = m.messages[0];
+            if (!msg.message || msg.key.fromMe) return;
 
-        const sender = msg.key.remoteJid;
-        let text = msg.message.conversation || 
-                   msg.message.extendedTextMessage?.text || 
-                   msg.message.imageMessage?.caption || "";
+            const sender = msg.key.remoteJid;
+            
+            // استخراج النص من أنواع الرسائل المختلفة
+            let text = msg.message.conversation || 
+                       msg.message.extendedTextMessage?.text || 
+                       msg.message.imageMessage?.caption || "";
 
-        if (text) {
-            console.log(`Message from ${sender}: ${text}`);
-            try {
+            if (text) {
+                console.log(`Message from ${sender}: ${text}`);
+                // إرسال الرسالة إلى بوت البايثون
                 await axios.post(PYTHON_BOT_URL, {
                     event: 'message',
                     payload: { from: sender, body: text, fromMe: false }
                 });
-            } catch (err) {
-                console.error("Webhook Error:", err.message);
             }
+        } catch (err) {
+            console.error("Error processing message:", err.message);
         }
     });
 }
 
+// تشغيل البوت
 startSock();
 
 // ------------------------------------------------------------------
@@ -157,58 +206,80 @@ app.get('/', async (req, res) => {
 
     if (isConnected) {
         return res.send(`
-            <center>
-                <h1>✅ WhatsApp Connected!</h1>
-                <p>The bot is running successfully.</p>
-            </center>
+            <div style="font-family: sans-serif; text-align: center; margin-top: 50px;">
+                <h1 style="color: green;">✅ WhatsApp Connected!</h1>
+                <p>The bot is active and listening.</p>
+            </div>
         `);
     }
 
     if (currentQR) {
-        // تحويل كود الباركود إلى صورة Base64
-        const qrImage = await QRCode.toDataURL(currentQR);
-        return res.send(`
-            <center>
-                <h1>📱 Scan This QR Code</h1>
-                <img src="${qrImage}" width="300" height="300" style="border: 5px solid #000; border-radius: 10px;" />
-                <p>Refresh page if needed.</p>
-                <script>setTimeout(function(){location.reload()}, 5000);</script>
-            </center>
-        `);
+        try {
+            const qrImage = await QRCode.toDataURL(currentQR);
+            return res.send(`
+                <div style="font-family: sans-serif; text-align: center; margin-top: 50px;">
+                    <h1>📱 Scan This QR Code</h1>
+                    <img src="${qrImage}" width="300" height="300" style="border: 5px solid #333; border-radius: 10px;" />
+                    <p>Reloading automatically...</p>
+                    <script>setTimeout(() => location.reload(), 5000);</script>
+                </div>
+            `);
+        } catch (e) {
+            return res.send("Error generating QR");
+        }
     }
 
     return res.send(`
-        <center>
-            <h1>⏳ Loading...</h1>
-            <p>Waiting for QR Code. Please refresh in a few seconds.</p>
-            <script>setTimeout(function(){location.reload()}, 3000);</script>
-        </center>
+        <div style="font-family: sans-serif; text-align: center; margin-top: 50px;">
+            <h1>⏳ Starting...</h1>
+            <p>Please wait while the connection is established.</p>
+            <script>setTimeout(() => location.reload(), 3000);</script>
+        </div>
     `);
 });
 
 // ------------------------------------------------------------------
-// API Endpoints
+// API Endpoints لإرسال الرسائل من البايثون
 // ------------------------------------------------------------------
 app.post('/api/sendText', async (req, res) => {
     const { chatId, text } = req.body;
+    if (!sock || !isConnected) return res.status(503).json({ error: "WhatsApp not connected" });
+    
     try {
         await sock.sendMessage(chatId, { text: text });
         res.json({ status: 'success' });
     } catch (err) {
+        console.error("Send Text Error:", err);
         res.status(500).json({ error: err.message });
     }
 });
 
 app.post('/api/sendFile', async (req, res) => {
-    const { chatId, file } = req.body;
+    const { chatId, file, mimetype, caption } = req.body; // تحسين استقبال المعاملات
+    if (!sock || !isConnected) return res.status(503).json({ error: "WhatsApp not connected" });
+
     try {
-        await sock.sendMessage(chatId, { 
-            audio: { url: file.url }, 
-            mimetype: 'audio/mp4',
-            ptt: false 
-        });
+        // يمكنك تعديل النوع بناءً على mimetype المرسل
+        const msgOptions = { 
+            document: { url: file.url },
+            mimetype: mimetype || 'application/pdf',
+            fileName: file.name || 'file',
+            caption: caption || ''
+        };
+
+        // إذا كان ملف صوتي
+        if (mimetype && mimetype.startsWith('audio')) {
+            delete msgOptions.document;
+            delete msgOptions.fileName;
+            msgOptions.audio = { url: file.url };
+            msgOptions.mimetype = mimetype;
+            msgOptions.ptt = false; // true إذا كنت تريدها كرسالة صوتية (Voice Note)
+        }
+
+        await sock.sendMessage(chatId, msgOptions);
         res.json({ status: 'success' });
     } catch (err) {
+        console.error("Send File Error:", err);
         res.status(500).json({ error: err.message });
     }
 });
