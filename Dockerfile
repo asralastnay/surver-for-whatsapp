@@ -1,5 +1,5 @@
 # ⚠️ التغيير الجذري: عدنا للنسخة v2.1.1 لأنها أخف من v2.2.2 ومستقرة على Render
-FROM atendai/evolution-api:v1.2.2
+FROM atendai/evolution-api:v2.0.0
 # 1. إعدادات السيرفر
 ENV SERVER_PORT=8080
 ENV SERVER_TYPE=http
