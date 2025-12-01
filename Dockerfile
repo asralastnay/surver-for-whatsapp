@@ -1,24 +1,39 @@
-# تأكد أن السطر الأول هو هذا بالضبط
-FROM codechat/api:v1.3.4
+# ⚠️ التغيير الجذري: عدنا للنسخة v2.1.1 لأنها أخف من v2.2.2 ومستقرة على Render
+FROM atendai/evolution-api:v2.1.1
 
-ENV PORT=8080
+# 1. إعدادات السيرفر
+ENV SERVER_PORT=8080
+ENV SERVER_TYPE=http
+ENV SERVER_URL=https://surver-for-whatsapp.onrender.com
 
-# إعدادات MongoDB
-ENV STORE_TYPE=mongodb
-ENV STORE_CONNECTION_URI="mongodb+srv://admin:abdallah12345@whatsapp-surver.kdxgo1l.mongodb.net/?retryWrites=true&w=majority&appName=whatsapp-surver"
-
-# إعدادات الأمان
+# 2. إعدادات الأمان (المفتاح الموحد)
 ENV AUTHENTICATION_TYPE=apikey
 ENV AUTHENTICATION_API_KEY=12345
+ENV AUTHENTICATION_EXPOSE_IN_URL=true
 
-# الويب هوك
-ENV WEBHOOK_URL="https://whatsapp-bot-jh7d.onrender.com/webhook"
-ENV WEBHOOK_ENABLED=true
-ENV WEBHOOK_EVENTS_MESSAGE_UPSERT=true
-ENV WEBHOOK_EVENTS_ERRORS=false
+# 3. قاعدة البيانات (ضرورية لحفظ الجلسة)
+ENV DATABASE_ENABLED=true
+ENV DATABASE_PROVIDER=postgresql
+ENV DATABASE_CONNECTION_URI="postgresql://neondb_owner:npg_dOCMAKR5s2ye@ep-withered-tree-ah2npho3-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require"
+ENV DATABASE_CLIENT_NAME=evolution_exchange
+ENV DATABASE_SAVE_DATA_INSTANCE=true
 
+# 🚫 تعطيل كل شيء يستهلك الذاكرة (مهم جداً)
+ENV DATABASE_SAVE_DATA_NEW_MESSAGE=false
+ENV DATABASE_SAVE_DATA_MESSAGES=false
+ENV DATABASE_SAVE_DATA_CHATS=false
+ENV DATABASE_SAVE_DATA_CONTACTS=false
+ENV TYPEBOT_ENABLED=false
+ENV OPENAI_ENABLED=false
+ENV CACHE_REDIS_ENABLED=false
+
+# 4. تحسينات الذاكرة القصوى
+# نحدد للعملية أن تستخدم 400 ميجا فقط وتترك الباقي للنظام
 ENV NODE_OPTIONS="--max-old-space-size=400"
-ENV LOG_LEVEL=error
-ENV DEL_INSTANCE=false
+
+# 5. الويب هوك
+ENV WEBHOOK_GLOBAL_URL="https://whatsapp-bot-jh7d.onrender.com/webhook"
+ENV WEBHOOK_GLOBAL_ENABLED=true
+ENV WEBHOOK_EVENTS_MESSAGE_UPSERT=true
 
 EXPOSE 8080
