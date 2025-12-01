@@ -1,35 +1,35 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const { Pool } = require('pg');
 const express = require('express');
 const axios = require('axios');
 const pino = require('pino');
-const QRCode = require('qrcode-terminal');
+const QRCode = require('qrcode'); // مكتبة توليد الصور
 
 const app = express();
 app.use(express.json());
 
 // ------------------------------------------------------------------
-// 1. إعداداتك (عدلها بما يناسبك)
+// إعدادات
 // ------------------------------------------------------------------
 const PORT = process.env.PORT || 8080;
-// رابط بوت البايثون الخاص بك
+// تأكد أن هذا الرابط هو رابط بوت البايثون الخاص بك
 const PYTHON_BOT_URL = "https://whatsapp-bot-jh7d.onrender.com/webhook"; 
-// رابط قاعدة بيانات Neon (ضعه في Environment Variables في راندر باسم DATABASE_URL)
 const CONNECTION_STRING = process.env.DATABASE_URL; 
 
+// متغير لتخزين كود الباركود الأخير
+let currentQR = null;
+let isConnected = false;
+
 // ------------------------------------------------------------------
-// 2. إعداد قاعدة البيانات (PostgreSQL Auth Adapter)
+// إعداد قاعدة البيانات
 // ------------------------------------------------------------------
 const pool = new Pool({ connectionString: CONNECTION_STRING, ssl: { rejectUnauthorized: false } });
 
-// دالة لإنشاء الجدول إذا لم يكن موجوداً
 async function initDb() {
     await pool.query(`CREATE TABLE IF NOT EXISTS auth_sessions (id VARCHAR(255) PRIMARY KEY, data TEXT)`);
 }
 
-// نظام التوثيق المربوط بقاعدة البيانات
 const usePostgresAuthState = async (saveCreds) => {
-    // تحميل البيانات من القاعدة
     const readData = async (type, id) => {
         const key = `${type}-${id}`;
         const res = await pool.query('SELECT data FROM auth_sessions WHERE id = $1', [key]);
@@ -37,7 +37,6 @@ const usePostgresAuthState = async (saveCreds) => {
         return null;
     };
 
-    // كتابة البيانات للقاعدة
     const writeData = async (data, type, id) => {
         const key = `${type}-${id}`;
         const value = JSON.stringify(data);
@@ -47,12 +46,6 @@ const usePostgresAuthState = async (saveCreds) => {
         );
     };
 
-    const removeData = async (type, id) => {
-        const key = `${type}-${id}`;
-        await pool.query('DELETE FROM auth_sessions WHERE id = $1', [key]);
-    };
-
-    // محاكاة نظام الملفات ولكن باستخدام الدوال أعلاه
     const state = {
         creds: await readData('creds', 'main') || (await import('@whiskeysockets/baileys')).initAuthCreds(),
         keys: {
@@ -86,7 +79,7 @@ const usePostgresAuthState = async (saveCreds) => {
 };
 
 // ------------------------------------------------------------------
-// 3. تشغيل الواتساب (Logic)
+// تشغيل الواتساب
 // ------------------------------------------------------------------
 let sock;
 
@@ -95,66 +88,60 @@ async function startSock() {
     const { state, saveCreds } = await usePostgresAuthState();
     const { version } = await fetchLatestBaileysVersion();
 
-    console.log(`بدء تشغيل Baileys نسخة: ${version.join('.')}`);
+    console.log(`Starting Baileys v${version.join('.')}`);
 
     sock = makeWASocket({
         version,
-        logger: pino({ level: 'silent' }), // تقليل الإزعاج في اللوج
-        printQRInTerminal: true, // سيظهر الباركود في اللوج
+        logger: pino({ level: 'silent' }),
+        printQRInTerminal: false, // عطلنا الطباعة في اللوج
         auth: state,
         browser: ["QuranBot", "Chrome", "1.0.0"],
-        // إعدادات مهمة لاستقرار الاتصال
         connectTimeoutMs: 60000,
         keepAliveIntervalMs: 10000,
         emitOwnEvents: false,
     });
 
-    // إدارة أحداث الاتصال
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
         
+        // إذا جاء باركود جديد، نحفظه في المتغير
         if (qr) {
-            console.log("\n⚠️ امسح الباركود بسرعة من اللوج أعلاه ⚠️\n");
+            currentQR = qr;
+            isConnected = false;
+            console.log("⚡ QR Code updated, check the website!");
         }
 
         if (connection === 'close') {
             const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('انقطع الاتصال. إعادة المحاولة؟', shouldReconnect);
+            console.log('Connection closed. Reconnecting:', shouldReconnect);
             if (shouldReconnect) startSock();
         } else if (connection === 'open') {
-            console.log('✅ تم الاتصال بالواتساب بنجاح!');
+            console.log('✅ Connection Opened!');
+            isConnected = true;
+            currentQR = null; // نمسح الباركود لأنه تم الاتصال
         }
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    // استقبال الرسائل وإرسالها للبايثون
     sock.ev.on('messages.upsert', async (m) => {
         const msg = m.messages[0];
         if (!msg.message || msg.key.fromMe) return;
 
         const sender = msg.key.remoteJid;
-        
-        // استخراج النص من مختلف أنواع الرسائل
         let text = msg.message.conversation || 
                    msg.message.extendedTextMessage?.text || 
                    msg.message.imageMessage?.caption || "";
 
         if (text) {
-            console.log(`📩 رسالة من ${sender}: ${text}`);
-            
-            // إرسال Webhook للبايثون
+            console.log(`Message from ${sender}: ${text}`);
             try {
                 await axios.post(PYTHON_BOT_URL, {
                     event: 'message',
-                    payload: {
-                        from: sender,
-                        body: text,
-                        fromMe: false
-                    }
+                    payload: { from: sender, body: text, fromMe: false }
                 });
             } catch (err) {
-                console.error("خطأ في إرسال الويب هوك:", err.message);
+                console.error("Webhook Error:", err.message);
             }
         }
     });
@@ -163,10 +150,45 @@ async function startSock() {
 startSock();
 
 // ------------------------------------------------------------------
-// 4. API (لاستقبال الأوامر من البايثون)
+// صفحة عرض الباركود (HTML)
 // ------------------------------------------------------------------
+app.get('/', async (req, res) => {
+    res.setHeader('Content-Type', 'text/html');
 
-// إرسال نص
+    if (isConnected) {
+        return res.send(`
+            <center>
+                <h1>✅ WhatsApp Connected!</h1>
+                <p>The bot is running successfully.</p>
+            </center>
+        `);
+    }
+
+    if (currentQR) {
+        // تحويل كود الباركود إلى صورة Base64
+        const qrImage = await QRCode.toDataURL(currentQR);
+        return res.send(`
+            <center>
+                <h1>📱 Scan This QR Code</h1>
+                <img src="${qrImage}" width="300" height="300" style="border: 5px solid #000; border-radius: 10px;" />
+                <p>Refresh page if needed.</p>
+                <script>setTimeout(function(){location.reload()}, 5000);</script>
+            </center>
+        `);
+    }
+
+    return res.send(`
+        <center>
+            <h1>⏳ Loading...</h1>
+            <p>Waiting for QR Code. Please refresh in a few seconds.</p>
+            <script>setTimeout(function(){location.reload()}, 3000);</script>
+        </center>
+    `);
+});
+
+// ------------------------------------------------------------------
+// API Endpoints
+// ------------------------------------------------------------------
 app.post('/api/sendText', async (req, res) => {
     const { chatId, text } = req.body;
     try {
@@ -177,24 +199,19 @@ app.post('/api/sendText', async (req, res) => {
     }
 });
 
-// إرسال ملف (صوت/صورة) عبر رابط
 app.post('/api/sendFile', async (req, res) => {
-    const { chatId, file, caption } = req.body;
+    const { chatId, file } = req.body;
     try {
-        // file.url يحتوي على رابط الصوت من بوت البايثون
         await sock.sendMessage(chatId, { 
             audio: { url: file.url }, 
-            mimetype: 'audio/mp4', // Baileys يحب mp4 للصوتيات أحياناً أو mpeg
-            ptt: false // false = ملف صوتي، true = ملاحظة صوتية (voice note)
+            mimetype: 'audio/mp4',
+            ptt: false 
         });
         res.json({ status: 'success' });
     } catch (err) {
-        console.error("فشل إرسال الملف:", err);
         res.status(500).json({ error: err.message });
     }
 });
-
-app.get('/', (req, res) => res.send('Baileys Server is Running! 🚀'));
 
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
